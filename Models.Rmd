@@ -1,0 +1,816 @@
+---
+title: "sensitivity"
+author: "Eliza Fink"
+date: "4/14/2022"
+output: html_document
+---
+# set up
+
+```{r setup, include=FALSE}
+# load packages
+
+library(tidyverse)
+library(lattice)
+library(caret)
+library(olsrr)
+library(RCurl)
+library(Matrix)
+library(lme4)
+library(sjPlot)
+library(readxl)
+```
+
+load datasets
+
+- model - full model
+- breakdown - subset of model conditional on breakdown
+- model_sp - subset of model with administrative data
+- model_part - subset of model with participating pumps
+- model_inst - subset of model that includes the date of installation
+
+```{r}
+# read in model data
+setwd("C:/Users/Eliza Fink/Desktop/WfG 2022")
+
+# data set excluding missing values (from "Data Compilation" RMarkdown)
+# n = 16398
+model <- read_csv("model.csv", col_types = cols(...1 = col_skip(), 
+    activity_date = col_date(format = "%Y-%m-%d")))
+
+# data set excluding missing values (from "Data Compilation" RMarkdown), but including sous-prefecture and prefecture
+# n = 13406
+model_sp <- read_csv("model_sp.csv", col_types = cols(...1 = col_skip(), 
+    activity_date = col_date(format = "%Y-%m-%d")))
+
+```
+```{r}
+#fix sous_prefecture typos
+
+model_sp$sous_prefecture <- as_factor(if_else(as_factor(model_sp$sous_prefecture) == "mongoumba", 
+                                              "moungoumba",
+                                              if_else(as_factor(model_sp$sous_prefecture) == "ngaounday",
+                                              "ngaoundaye", model_sp$sous_prefecture)))
+```
+
+pump type - add india mark 3 and 4 to india mark 2 and electric to other because they are too small of categories
+
+```{r}
+model <- model %>%
+  mutate(
+    pump_type = if_else(pump_type %in% c("india_mark_2", "india_mark_3", "india_mark_4"),
+                        "india_mark", pump_type),
+    pump_type = if_else(pump_type == "electric", "other", pump_type)
+  )
+
+model_sp <- model_sp %>%
+  mutate(
+    pump_type = if_else(pump_type %in% c("india_mark_2", "india_mark_3", "india_mark_4"),
+                        "india_mark", pump_type),
+    pump_type = if_else(pump_type == "electric", "other", pump_type)
+  )
+```
+
+model conditional on breakdown
+```{r}
+breakdown <- model[which(model$pump_working == FALSE),]
+# n = 3066
+```
+
+only pumps labeled as "participating" in 2020
+```{r}
+participating <- as_vector(read_csv("participating_2020.csv"))
+
+model_part <- model[which(model$well_ID %in% participating),]
+# n = 12297
+
+breakdown_part <- model_part[which(model_part$pump_working == FALSE),]
+```
+
+model of only wells with installation data
+```{r, warning = FALSE}
+# data that has well installation information
+
+# read in well installation dates
+
+wells <- read_excel("C:/Users/Eliza Fink/Desktop/WfG 2021/Raw Data/wells 1-1-2012.xlsx", 
+                             col_types = c("text", "skip", "skip", 
+                                           "skip", "skip", "skip", "skip", "skip", 
+                                           "skip", "numeric", "numeric", "date", 
+                                           "numeric", "numeric", "numeric", 
+                                           "numeric", "numeric", "numeric", 
+                                           "numeric", "numeric", "numeric", 
+                                           "numeric", "numeric", "text", "text", 
+                                           "text", "numeric", "numeric", "numeric", 
+                                           "numeric", "skip", "numeric", "text", 
+                                           "text", "text", "text", "text"))
+
+wells <- wells[,c("well_id", "install_date")]
+wells <- rename(wells,  "well_ID" = "well_id")
+
+model_inst <- left_join(model, wells)
+model_inst <- model_inst[which(!is.na(model_inst$install_date)),]
+
+```
+
+# basic models
+
+Models reported in body of paper
+Full data sets and 
+
+## working 
+
+Predictor Variables:
+  - Time since last maintenance visit
+  - Hybrid Moto
+  - Rapid Response
+  - Distance to WfG office
+  - Distance to Urban Center
+  - Population
+  - NN
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up +
+                         (1 | well_ID),
+                       data = model, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_main.csv")
+
+tab_model(glmer_working)
+```
+
+
+## fixed 
+
+Predictor Variables:
+  - Community payment
+  - Time since last maintenance visit
+  - Hybrid Moto
+  - Rapid Response
+  - Distance to WfG office
+  - Distance to Urban Center
+  - Population
+  - NN
+  
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | well_ID),
+                       data = breakdown, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(breakdown$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_main.csv")
+
+tab_model(glmer_fixed)
+```
+
+## payment
+
+Predictor Variables:
+  - Pump Working
+  - Pump Fixed
+  - Time since last maintenance visit
+  - Hybrid Moto
+  - Rapid Response
+  - Distance to WfG office
+  - Distance to Urban Center
+  - Population
+  - NN
+  
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | well_ID),
+                       data = model, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_main.csv")
+
+tab_model(glmer_payment)
+``` 
+
+# with administrative sub-region data
+
+## working
+
+### prefecture
+
+#### fixed effect
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up + prefecture +
+                         (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_sp$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_pref.csv")
+```
+
+#### random effect
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up + (1 | prefecture) +
+                         (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_sp$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_pref_r.csv")
+
+tab_model(glmer_working)
+```
+
+### sous-prefecture
+
+#### fixed effect
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up + sous_prefecture +
+                         (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_sp$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_sous.csv")
+```
+
+#### random effect
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up  + (1 | sous_prefecture) +
+                         (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_sp$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_sous_r.csv")
+
+tab_model(glmer_working)
+```
+
+## fixed
+
+### prefecture
+
+#### fixed
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + prefecture + (1 | well_ID),
+                       data = model_sp[which(model_sp$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(model_sp[which(model_sp$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_pref.csv")
+```
+
+#### random
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | prefecture) + (1 | well_ID),
+                       data = model_sp[which(model_sp$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(model_sp[which(model_sp$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_pref_r.csv")
+
+tab_model(glmer_fixed)
+```
+
+### sous-prefecture
+
+#### fixed
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + sous_prefecture + (1 | well_ID),
+                       data = model_sp[which(model_sp$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(model_sp[which(model_sp$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_sous.csv")
+```
+#### random
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | sous_prefecture) + (1 | well_ID),
+                       data = model_sp[which(model_sp$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(model_sp[which(model_sp$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_sous_r.csv")
+
+tab_model(glmer_fixed)
+```
+
+## payment
+
+### prefecture
+
+#### fixed
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + prefecture + (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_sp$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_pref.csv")
+``` 
+#### random
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | prefecture) + (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_sp$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_pref_r.csv")
+
+tab_model(glmer_payment)
+``` 
+
+### sous-prefecture
+
+#### fixed
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + sous_prefecture + (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_sp$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_sous.csv")
+``` 
+
+#### random
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | sous_prefecture) + (1 | well_ID),
+                       data = model_sp, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_sp$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_sous_r.csv")
+
+tab_model(glmer_payment)
+``` 
+
+# with excluding outliers
+
+Screen for outliers
+```{r}
+
+# create mahalanobis scores (multidimensional distance from mean)
+mahal <- mahalanobis(model[ , c("time_between",
+                                "dist_office", "urban_center", "average_nn", "Population_1k")], 
+                     colMeans(model[ , c("time_between",
+                                "dist_office", "urban_center", "average_nn", "Population_1k")], na.rm = TRUE),
+                     cov(model[ , c("time_between",
+                                "dist_office", "urban_center", "average_nn", "Population_1k")], use="pairwise.complete.obs"))
+
+
+# find cutoff for bad scores
+
+cutoff = qchisq(1 - .001,ncol(model[ , c("time_between", "dist_office", 
+                                         "urban_center", "average_nn", "Population_1k")]))
+
+ncol(model[ , c("time_between","dist_office", "urban_center", "average_nn", "Population_1k")]) ##this is degrees of freedom (for chi squared not analysis)
+cutoff
+
+#find out how many observations are outliers
+summary(mahal < cutoff)
+#451 observations are outliers out of 16398, ~3%
+#check later if removing these pumps changes things
+
+# remove outliers
+no_outliers <- subset(model, mahal < cutoff)
+# no outliers, 15947 observations
+
+
+# look at outliers
+outliers <- subset(model, mahal > cutoff)
+# 160 / 451 pumps not working 
+# 109 / 451 pumps not fixed
+
+```
+
+## working
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up +
+                         (1 | well_ID),
+                       data = no_outliers, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(no_outliers$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_noout.csv")
+```
+
+## fixed
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | well_ID),
+                       data = no_outliers[which(no_outliers$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(no_outliers[which(no_outliers$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_noout.csv")
+```
+
+## payment
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | well_ID),
+                       data = no_outliers, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(no_outliers$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_noout.csv")
+``` 
+
+# participating
+
+## working
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up +
+                         (1 | well_ID),
+                       data = model_part, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_part$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_part.csv")
+```
+
+## fixed
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | well_ID),
+                       data = breakdown_part, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(breakdown_part$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_part.csv")
+```
+
+## payment
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | well_ID),
+                       data = model_part, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_part$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_part.csv")
+``` 
+
+# well installation
+
+## working
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_between + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up + 
+                         + install_date +
+                         (1 | well_ID),
+                       data = model_inst, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model_inst$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_inst.csv")
+```
+
+## fixed
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_between + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + install_date + (1 | well_ID),
+                       data = model_inst[which(model_inst$pump_working == FALSE),], 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(model_inst[which(model_inst$pump_working == FALSE),]$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_inst.csv")
+```
+
+## payment
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_between +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + install_date + (1 | well_ID),
+                       data = model_inst, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model_inst$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_inst.csv")
+``` 
+
+# time unit to years instead of days 
+
+```{r}
+model$time_bw_year <- model$time_between / 365
+breakdown$time_bw_year <- breakdown$time_between / 365
+```
+
+
+## working
+
+```{r}
+glmer_working <- glmer(pump_working ~ time_bw_year + eep_moto +
+                         rapid + dist_office + urban_center + 
+                         Population_1k + 
+                         average_nn + pump_type + follow_up +
+                         (1 | well_ID),
+                       data = model, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_working)
+
+confusionMatrix(as_factor(predict(glmer_working, type="response") >= 0.5), 
+                as_factor(model$pump_working))
+
+save_table <- cbind(coef(summary(glmer_working)), confint(glmer_working, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/working_year.csv")
+```
+
+## fixed
+
+```{r}
+glmer_fixed <- glmer(pump_fixed ~ time_bw_year + eep_moto + payment_YN +
+                         rapid + dist_office + urban_center +
+                       Population_1k + follow_up + pump_type +
+                         average_nn + (1 | well_ID),
+                       data = breakdown, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_fixed)
+
+confusionMatrix(as_factor(predict(glmer_fixed, type="response") >= 0.5), 
+                as_factor(breakdown$pump_fixed))
+
+save_table <- cbind(coef(summary(glmer_fixed)), confint(glmer_fixed, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/fixed_year.csv")
+```
+
+## payment
+
+```{r}
+glmer_payment <- glmer(payment_YN ~ last_funct +
+                         time_bw_year +
+                         eep_moto + pump_working + pump_fixed +
+                         rapid + dist_office + urban_center + Population_1k +
+                         average_nn + (1 | well_ID),
+                       data = model, 
+                       family = binomial(link = 'logit'),
+                       control = glmerControl(optimizer = "bobyqa"),
+                       nAGQ = 0)
+
+summary(glmer_payment)
+
+confusionMatrix(as_factor(predict(glmer_payment, type="response") >= 0.5), 
+                as_factor(model$payment_YN))
+
+save_table <- cbind(coef(summary(glmer_payment)), confint(glmer_payment, parm = 'beta_', method = 'Wald'))
+write.csv(save_table, file = "model_outputs/payment_year.csv")
+``` 

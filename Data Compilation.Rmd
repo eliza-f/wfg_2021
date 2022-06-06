@@ -1,0 +1,644 @@
+---
+title: "WfG Data Compilation"
+author: "Eliza Fink"
+date: "4/3/2022"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lubridate)
+library(tidyverse)
+library(sf)
+library(units)
+library(maptools)
+library(spatstat)
+
+setwd("C:/Users/Eliza Fink/Desktop/WfG 2022")
+```
+
+# Load Data Sources
+
+```{r}
+# maintenance records 2012 - 2018
+visits12 <- read.csv("2012_full_data.csv")
+# maintenance records 2019
+visits19 <- read.csv("2019_full_data.csv")
+# maintenance records 2020
+visits20 <- read.csv("2020_full_data.csv")
+```
+
+# Calculate Co-variables
+
+## From Maintenance and Well Data
+
+see maint_data.R
+
+```{r}
+# combine all data into one data frmae
+visits <- bind_rows(visits12, visits19, visits20)
+
+# remove observations without missing date
+visits <- visits[which(visits$activity_date != "" &
+                         is.na(visits$activity_date) == FALSE),]
+
+rm("visits12", "visits19", "visits20")
+```
+
+List of Wells
+
+```{r}
+visits$decom <- ifelse(visits$pump_fixed == "decommissioned" |
+                         visits$pump_fixed == "Désactiver cette point d'eau", visits$activity_date, "")
+
+
+```
+
+Write CSV - add time_between and last_funct
+
+```{r}
+write.csv(visits, file = "1220maint.csv") 
+# added last known functionality and time between in excel before reloading
+
+#################################################################################
+```
+
+don't rerun above this point!
+
+```{r}
+visits <- read.csv("1220maint.csv")
+```
+
+
+wells
+
+```{r}
+#get rid of NA values for lat/long
+
+# mode function
+calcmode <- function(a) {  
+  vector <- unique(a)  
+  vector[which.max(tabulate(match(a, vector)))]  
+} 
+
+wells <- visits[which(!is.na(visits$Latitude) &
+                         visits$Longitude > 0),]
+
+wells$sous_prefecture <- str_to_lower(wells$sous_prefecture)
+wells$prefecture <- str_to_lower(wells$prefecture)
+
+wells <- wells %>% 
+  group_by(well_ID) %>%
+  summarise(
+    total_visits = n(),
+    first_visit = min(as_date(mdy(activity_date))),
+    decom_date = min(as_date(mdy(decom))),
+    last_date = max (as_date(mdy(activity_date))),
+    Latitude = median(Latitude),
+    Longitude = median(Longitude),
+    prefecture = calcmode(prefecture),
+    sous_prefecture = calcmode(sous_prefecture)
+    )
+
+```
+
+
+2020 participating pumps
+```{r}
+participating <- read.csv("participating_2020.csv")
+
+participating <- as_vector(participating[1])
+
+wells$participating <- if_else(wells$well_ID %in% participating, TRUE, FALSE)
+```
+
+
+
+maintenance data
+
+```{r}
+# make activity date into date format
+
+visits <- visits %>%
+  mutate(
+    activity_date = as_date(mdy(activity_date)),
+    Year = year(activity_date)
+  )
+
+
+# calculate the sum and percentage of past breakdowns for each pump
+
+sum_past_broken <- c()
+percent_past_broken <- c()
+
+for(i in 1:(dim(visits)[1])){
+  this_id <- visits[i, "well_ID"]
+  this_data <- visits[which(visits$well_ID == this_id),]
+  past_data <- this_data[which(this_data$activity_date < visits[i, "activity_date"]),]
+  sum_past_broken <- append(sum_past_broken, 
+                            dim(past_data)[1] - sum(past_data$pump_working))
+  percent_past_broken<- append(percent_past_broken, sum_past_broken[i] / dim(past_data)[1])
+}
+
+
+visits$sum_past_broken<- sum_past_broken
+visits$percent_past_broken<- percent_past_broken
+visits$percent_past_broken[is.na(visits$percent_past_broken)] <- 0
+
+rm(list=c("sum_past_broken", "percent_past_broken", "this_data", "past_data", "i", "this_id"))
+
+
+# payment
+
+# if there was any payment mark true
+
+visits$payment_YN <- if_else(visits$payment > 0, TRUE, FALSE, FALSE)
+
+# pump types
+
+visits$pump_type <- as_factor(tolower(visits$pump_type))
+
+visits <- visits %>%
+  mutate(
+    pump_type = recode (
+      pump_type, 
+      'hpv_60_2000' = 'hpv_60',
+      'india_mk_ii' = 'india_mark_2',
+      'decommissioned' = 'other',
+      'vergnet_hpv_60_meter' = 'hpv_60',
+      'vergnet hpv 60 2000' = 'hpv_60',
+      'vergnet hpv 60' = 'hpv_60',
+      'decommissioned' = 'other',
+      'autres' = 'other',
+      'vergnet hpv 100' = 'hpv_100',
+      'vergnet hydro india' = 'hydro_india',
+      'electrique' = 'electric',
+      'vergnet hpv 60/2000 compteur' = 'hpv_60',
+      'pompe électrique solaire avec tour' = 'other',
+      'india mark 2' = 'india_mark_2',
+      'lifepump' = 'other',
+    )
+  )
+
+visits$pump_type <- as_factor(if_else(visits$pump_type == "", "other", as.character(visits$pump_type)))
+
+# follow up
+# is the visit a follow up? 2020 only
+
+visits$follow_up <- visits$service_visit_type == "Visite de suivi"
+
+# eep moto
+# was the vist conducted by the eep moto teams (hybrid motorcycle)
+
+visits$eep_moto <- visits$team_number %in% c("EEP Moto 1", "eep_moto_1", 
+                                             "eep_moto_2", "EEP Moto 2", "Animateur Moto 1")
+
+# rapid response
+# was the pump in the rapid response program?
+
+
+# list of pumps enrolled in the program
+rapid_pumps <- unique(visits[which(visits$service_visit_type == "rapid_response" |
+                                     visits$service_visit_type == "Réponse rapide" ),"well_ID"])
+
+# code all visits as rapid response if they are in the list of rapid response pumps between first date of program and end of 2020
+
+visits$rapid <- visits$well_ID %in% rapid_pumps &
+  visits$activity_date >= min(visits[which(visits$service_visit_type == "rapid_response"),"activity_date"])
+
+# month factor
+
+visits$month <- month(visits$activity_date, label = TRUE)
+```
+
+## Population data
+
+
+```{r}
+
+# load facebook population data
+pop <- read.csv("pop_caf_fb.csv") #population in 2018
+
+# transform wells to spatial datatype
+
+wells.st <- st_as_sf(wells, coords = c("Longitude", "Latitude"), crs = 4326)%>%
+  st_transform(crs = 32633)
+
+# empty data frame to fill in loop
+well_pop <- data.frame(well_ID = c(),
+                       pop_1k = c(),
+                       pop_3k = c())
+
+
+# loop the population (2018) within 1 and 3 k of each well
+for (i in 1:dim(wells.st)[1]) {
+
+  # which ID are we looking at
+  id <- wells.st$well_ID[i]
+  lat <- wells$Latitude[i]
+  lon <- wells$Longitude[i]
+  
+  # makes small data frame +/- .1 degree from the well to reduce calculations
+  lil_pop <- pop[pop$Lat > lat - .1 &
+                  pop$Lat < lat + .1 &
+                  pop$Lon > lon - .1 &
+                  pop$Lon < lon + .1, ]
+  
+  # transform to spatial
+  lil_pop <- st_as_sf(lil_pop, coords = c("Lon", "Lat"), crs = 4326)%>%
+    st_transform(crs = 32633)
+  
+  # calculate distance to each raster point to pump
+  lil_pop$distance <- st_distance(lil_pop$geometry, wells.st$geometry[i])
+  
+  # distances we are interested in
+  threekm <- 3000
+  onekm <- 1000
+  units(threekm) <- as_units("m")
+  units(onekm) <- as_units("m")
+  
+  # sum raster points less than distances
+  onekpop <- sum(lil_pop[lil_pop$distance < onekm,]$Population)
+  threekpop <- sum(lil_pop[lil_pop$distance < threekm,]$Population)
+  
+  # bind to data frame
+  add <- data.frame(well_ID = id,
+                    pop_1k = onekpop,
+                    pop_3k = threekpop)
+  
+  well_pop = bind_rows(well_pop, add)
+  
+}
+
+
+```
+
+make sure to calculate population growth correctly -- see excel file for correct transformations
+
+see pop_check.R file
+
+Population Growth Adjustment
+
+based on World Bank growth information here: https://data.worldbank.org/indicator/SP.POP.GROW?locations=CF
+```{r}
+
+# population growth adjustment
+
+grow13 = 1.002596476
+grow14 = 1.003641339
+grow15 = 1.006475158
+grow16 = 1.009857841
+grow17 = 1.012774835
+grow18 = 1.015191175
+grow19 = 1.016746616
+grow20 = 1.017668450
+
+
+
+well_pop1 <- well_pop[,1:2]
+well_pop1 <- well_pop1 %>%
+  rename(
+    pop18 = pop_1k
+  )
+
+well_pop3 <- well_pop[,c(1,3)]
+well_pop3 <- well_pop3 %>%
+  rename(
+    pop18 = pop_3k
+  )
+
+well_pop1 <- well_pop1 %>%
+  mutate(
+    pop19 = pop18 * grow19,
+    pop20 = pop18 * grow19 * grow20,
+    pop17 = pop18 / grow18,
+    pop16 = pop18 / grow18 / grow17,
+    pop15 = pop18 / grow18 / grow17 / grow16,
+    pop14 = pop18 / grow18 / grow17 / grow16 / grow15,
+    pop13 = pop18 / grow18 / grow17 / grow16 / grow15 / grow14,
+    pop12 = pop18 / grow18 / grow17 / grow16 / grow15/ grow14 / grow13
+  )
+
+well_pop3 <- well_pop3 %>%
+  mutate(
+    pop19 = pop18 * grow19,
+    pop20 = pop18 * grow19 * grow20,
+    pop17 = pop18 / grow18,
+    pop16 = pop18 / grow18 / grow17,
+    pop15 = pop18 / grow18 / grow17 / grow16,
+    pop14 = pop18 / grow18 / grow17 / grow16 / grow15,
+    pop13 = pop18 / grow18 / grow17 / grow16 / grow15 / grow14,
+    pop12 = pop18 / grow18 / grow17 / grow16 / grow15/ grow14 / grow13
+  )
+
+# pivot data frames
+
+well_pop1 <- well_pop1 %>%
+  rename(
+    '2012' = 'pop12',
+    '2013' = 'pop13',
+    '2014' = 'pop14',
+    '2015' = 'pop15',
+    '2016' = 'pop16',
+    '2017' = 'pop17',
+    '2018' = 'pop18',
+    '2019' = 'pop19',
+    '2020' = 'pop20'
+  )
+
+
+well_pop1 <- well_pop1 %>%
+  pivot_longer(c('2012','2013','2014','2015','2016','2017','2018','2019', '2020'), 
+               names_to = "Year", values_to = "Population_1k")
+
+well_pop3 <- well_pop3 %>%
+  rename(
+    '2012' = 'pop12',
+    '2013' = 'pop13',
+    '2014' = 'pop14',
+    '2015' = 'pop15',
+    '2016' = 'pop16',
+    '2017' = 'pop17',
+    '2018' = 'pop18',
+    '2019' = 'pop19',
+    '2020' = 'pop20'
+  )
+
+well_pop3 <- well_pop3 %>%
+  pivot_longer(c('2012','2013','2014','2015','2016','2017','2018','2019','2020'), 
+               names_to = "Year", values_to = "Population_3k")
+
+
+pop_tot <- left_join(well_pop1, well_pop3)
+
+write.csv(pop_tot, file = "pop.csv")
+
+rm(list = c("lil_pop", "well_pop", "well_pop1", "well_pop3", "grow13", "grow14", "grow15", "grow16",
+            "grow17", "grow18", "grow19", "grow20"))
+
+```
+
+Don't run above here for pop
+
+```{r}
+pop_wells <- read_csv("pop.csv", 
+    col_types = cols(...1 = col_skip()))
+```
+
+
+## Spatial
+
+```{r}
+cities <- read.csv("CAR_cities.csv")
+```
+
+
+average distance to nearest 5 water for good wells
+
+```{r}
+
+# nearest neighbor
+# well.spat (spatial) data frame will contain all spatial variables of wells
+well.spat <- data.frame(
+  well_ID = character(),
+  Year = numeric(),
+  average_nn = numeric()
+)
+
+#calculate nearest neighbor
+for(i in 2012:2020){
+  #make separate data frame for that year
+  #get rid of wells not yet visited
+  wellsyear <- wells.st[which(year(wells.st$first_visit) <= i),]
+  #get rid of decommissioned wells
+  wellsyear <- wellsyear[which(year(wellsyear$decom_date) >= i |
+                                 is.na(wellsyear$decom_date) == TRUE),]
+  
+  wellsyear$Year <- i
+  
+  #change to spatial data frame object
+  wellsyear.ppp <- as(wellsyear, "Spatial")
+  #to ppp format, for use in spat stat
+  wellsyear.ppp <- as(wellsyear.ppp, "ppp")
+  
+  #distance in meters to nearest neighbor
+  wellsyear$dist1 <- nndist(wellsyear.ppp)
+  #distance in meters to second nearest neighbor
+  wellsyear$dist2 <- nndist(wellsyear.ppp, k = 2)
+  #distance to third nearest neighbor
+  wellsyear$dist3 <- nndist(wellsyear.ppp, k = 3)
+  #calculate nearest neighbor estimates
+  wellsyear$dist4 <- nndist(wellsyear.ppp, k = 4)
+  #calculate nearest neighbor estimates
+  wellsyear$dist5 <- nndist(wellsyear.ppp, k = 5)
+  #calculate nearest neighbor estimates
+  
+  wellsyear <- wellsyear %>% mutate(
+    average_nn = (dist1 + dist2 + dist3 + dist4 + dist5) / 5
+  )
+  
+  wellsyear$geometry <- NULL
+  
+  
+  wellsyear <- wellsyear[,c(1,9,15)]
+
+  well.spat <- rbind(well.spat, wellsyear)
+}
+
+```
+
+distance to water for good office
+distance to nearest urban center
+
+```{r}
+# distance to headquarters AND distance to nearest urban center
+##distance to office calculation
+BanguiHQ <- cities[14,c(2:3)]
+BerberatiHQ <- cities[15,c(2:3)]
+
+BanguiHQ <- sf::st_as_sf(BanguiHQ, coords = c("Long", "Lat"), crs = 4326)
+BerberatiHQ <- sf::st_as_sf(BerberatiHQ, coords = c("Long", "Lat"), crs = 4326)
+
+wells.st <- sf::st_as_sf(wells, coords = c("Longitude", "Latitude"), crs = 4326)
+# calculate distance to headquarters in meters
+wells.st$dist_ban <- sf::st_distance(wells.st$geometry,BanguiHQ$geometry[1])
+wells.st$dist_ber <- sf::st_distance(wells.st$geometry,BerberatiHQ$geometry[1])
+
+wells.st$dist_office <- ifelse(wells.st$dist_ber < wells.st$dist_ban, 
+                               wells.st$dist_ber / 1000, 
+                               wells.st$dist_ban / 1000)
+
+#distance to city calculation
+cities.sf <- sf::st_as_sf(cities, coords = c("Long", "Lat"), crs = 4326)
+
+bangui <- cities.sf[1,4]
+bimbo <- cities.sf[2,4]
+berberati <- cities.sf[3,4]
+carnot <- cities.sf[4,4]
+bambari <- cities.sf[5,4]
+bouar <- cities.sf[6,4]
+bassan <- cities.sf[7,4]
+bria <- cities.sf[8,4]
+nola <- cities.sf[9,4]
+kaga <- cities.sf[10,4]
+sibut <- cities.sf[11,4]
+mbaiki <- cities.sf[12,4]
+bozoum <- cities.sf[13,4]
+
+
+wells.st <- wells.st %>%
+  mutate(
+    bangui = sf::st_distance(wells.st$geometry,bangui$geometry[1]),
+    bimbo = sf::st_distance(wells.st$geometry,bimbo$geometry[1]),
+    berberati = sf::st_distance(wells.st$geometry,berberati$geometry[1]),
+    carnot = sf::st_distance(wells.st$geometry,carnot$geometry[1]),
+    bambari = sf::st_distance(wells.st$geometry,bambari$geometry[1]),
+    bouar = sf::st_distance(wells.st$geometry,bouar$geometry[1]),
+    bassan = sf::st_distance(wells.st$geometry,bassan$geometry[1]),
+    bria = sf::st_distance(wells.st$geometry,bria$geometry[1]),
+    nola = sf::st_distance(wells.st$geometry,nola$geometry[1]),
+    kaga = sf::st_distance(wells.st$geometry,kaga$geometry[1]),
+    sibut = sf::st_distance(wells.st$geometry,sibut$geometry[1]),
+    mbaiki = sf::st_distance(wells.st$geometry,mbaiki$geometry[1]),
+    bozoum = sf::st_distance(wells.st$geometry,bozoum$geometry[1])
+  )
+
+wells.st <- wells.st %>%
+  rowwise() %>%
+  mutate(
+    urban_center = min(bangui, bimbo, berberati, carnot, bambari, bouar, bassan,
+                       bria, nola, kaga, sibut, mbaiki, bozoum)
+  )
+
+wells.st$urban_center <- wells.st$urban_center / 1000
+wells.st$urban_center <- as.numeric(wells.st$urban_center)
+
+distances <- wells.st[,c("well_ID", "participating", "dist_office", "urban_center")]
+
+```
+
+
+## Combine into one data frame
+
+
+```{r}
+full_data <- left_join(visits, distances)
+full_data <- left_join(full_data, well.spat)
+full_data <- left_join(full_data, pop_wells)
+```
+additional factors
+
+```{r}
+full_data$month <- factor(month(full_data$activity_date, label = TRUE, abbr = TRUE), ordered = FALSE)
+####add factor for conflict
+full_data$conflict <- full_data$Year %in% c(2013, 2014)
+####add flipped payment outcome
+####change nearest neighbor units to kilometers
+full_data$average_nn <- full_data$average_nn / 1000
+# now all distance units are in km
+
+write.csv(full_data, file = "full_data.csv")
+```
+
+those to use in modeling
+
+```{r}
+model <- full_data[,c("well_ID","pump_fixed","pump_working", "payment_YN","activity_date",
+                      "Year", "month", "time_between", "last_funct", "pump_type", "sum_past_broken", 
+                      "percent_past_broken", "follow_up", "eep_moto", "rapid", "dist_office", 
+                      "urban_center", "average_nn", "Population_1k", "Population_3k", "conflict",
+                      "participating")]
+
+model <- model[which(!apply(model, MARGIN = 1, function(x) sum(is.na(x))>0)),]
+
+write.csv(model, file = "model.csv")
+```
+
+those in modeling including pref/sous-pref
+
+```{r}
+model_sp <- full_data[,c("well_ID","pump_fixed","pump_working", "payment_YN","activity_date",
+                      "Year", "month", "time_between", "last_funct", "pump_type", "sum_past_broken", 
+                      "percent_past_broken", "follow_up", "eep_moto", "rapid", "dist_office", 
+                      "urban_center", "average_nn", "Population_1k", "Population_3k", "conflict",
+                      "participating", "prefecture", "sous_prefecture")]
+
+model_sp <- model_sp[which(!apply(model_sp, MARGIN = 1, function(x) sum(is.na(x))>0)),]
+
+model_sp <- model_sp[which(model_sp$sous_prefecture != ""),]
+model_sp$prefecture <- str_to_lower(model_sp$prefecture)
+model_sp$sous_prefecture <- str_to_lower(model_sp$sous_prefecture)
+
+
+clean_pre <- function(string) {
+  string <- str_replace_all(string, "mambere kadei", "mamberekadei")
+  string <- str_replace_all(string, "sanghambaere", "sangha-mbaéré")
+  string <- str_replace_all(string, "ouham pende", "ouhampende")
+  string <- str_replace_all(string, "nanamambere", "nana-mambere")
+  string <- str_replace_all(string, "ombelampoko", "ombella m'poko")
+  string <- str_replace_all(string, "ombella m poko", "ombella m'poko")
+  string <- str_replace_all(string, "nana mambere", "nana-mambere")
+  string <- str_replace_all(string, "mambéré kadeï", "mamberekadei")
+  string <- str_replace_all(string, "membéré kadeï", "mamberekadei")
+  string <- str_replace_all(string, "mambere kadeï", "mamberekadei")
+  string <- str_replace_all(string, "ombela mpoko", "ombella m'poko")
+  string <- str_replace_all(string, "sangha-mbaere", "sangha-mbaéré")
+  string <- str_replace_all(string, "sangha-mba?r?", "sangha-mbaéré")
+  string <- str_replace_all(string, "k?mo", "kemo")
+  string <- str_replace_all(string, "sangha-mbaérééré", "sangha-mbaéré")
+  string <- str_replace_all(string, "sangha mbaere", "sangha-mbaéré")
+  string <- str_replace_all(string, "sangha-mbaéré?r?", "sangha-mbaéré")
+  string <- str_replace_all(string, "nana-mamberei", "nana-mambere")
+  string <- str_replace_all(string, "kekemo", "kemo")
+  string <- str_replace_all(string, "k?kemo", "kemo")
+  return(string)
+}
+
+model_sp$prefecture <- clean_pre(model_sp$prefecture)
+
+model_sp$prefecture <- if_else(
+  model_sp$prefecture == "kekemo" | model_sp$prefecture == "k?kemo", "kemo", model_sp$prefecture
+)
+
+model_sp$prefecture <- if_else(
+  model_sp$prefecture == "sangha-mbaéré?r?", "sangha-mbaéré", model_sp$prefecture
+)
+
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "berb?rati", "berberati", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "mba?ki", "mbaiki", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "amadagaza", "amada-gaza", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "sosso -nakombo", "sosso nakombo", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "d?d?dedemokouba", "dedemokouba", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "bossemt?le", "bossemtele", model_sp$sous_prefecture)
+model_sp$sous_prefecture <- if_else(model_sp$sous_prefecture == "bossemb?le", "bossembele", model_sp$sous_prefecture)
+
+clean_sp <- function(string) {
+  string <- str_replace_all(string, "berb?rati", "berberati")
+  string <- str_replace_all(string, "mba?ki", "mbaiki")
+  string <- str_replace_all(string, "mbaïki", "mbaiki")
+  string <- str_replace_all(string, "bossemptele", "bossemtele")
+  string <- str_replace_all(string, "bossemt?le", "bossemtele")
+  string <- str_replace_all(string, "ombella m poko", "ombella m'poko")
+  string <- str_replace_all(string, "nana mambere", "nana-mambere")
+  string <- str_replace_all(string, "dedemoukouba", "dedemokouba")
+  string <- str_replace_all(string, "dede moukouba", "dedemokouba")
+  string <- str_replace_all(string, "dede mokouba", "dedemokouba")
+  string <- str_replace_all(string, "dede mokouba", "dedemokouba")
+  string <- str_replace_all(string, "dede-mokouba", "dedemokouba")
+  string <- str_replace_all(string, "d?d?-mokouba", "dedemokouba")
+  string <- str_replace_all(string, "nana bakassa", "nanabakassa")
+  string <- str_replace_all(string, "m'baïki", "mbaiki")
+  string <- str_replace_all(string, "dédé mokouba", "dedemokouba")
+  string <- str_replace_all(string, "berbérati", "berberati")
+  string <- str_replace_all(string, "bérbérati", "berberati")
+  string <- str_replace_all(string, "bibmbo", "bimbo")
+  return(string)
+}
+
+model_sp$sous_prefecture <- clean_sp(model_sp$sous_prefecture)
+
+write.csv(model_sp, file = "model_sp.csv")
+```
+
